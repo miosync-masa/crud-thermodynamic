@@ -4,6 +4,11 @@
 
 This repository contains the complete simulation code, data, and manuscript source for our work demonstrating that Landauer's erasure principle is a special case of a broader CRUD (Create, Read, Update, Delete) information thermodynamics.
 
+## Formal Verification
+
+Machine-checked proofs of the core mathematical results are in
+[`lean4-proof/`](lean4-proof/). Built with Lean 4 + Mathlib, zero `sorry`.
+
 ## Key Result
 
 All four CRUD operations are governed by a single nonequilibrium free-energy bound:
