@@ -50,7 +50,7 @@ from jax import random, jit, vmap
 # CONFIG
 # ============================================================
 
-VERSION = "CRUD-FIG-FINAL-v1.1"
+VERSION = "CRUD-FIG-FINAL-v1.2-idle-baseline"
 
 KB = 1.0
 GAMMA = 1.0
@@ -92,7 +92,14 @@ DKL_BINS_SENSITIVITY = [120, 240, 480]
 ENABLE_GPU_POWER_LOG = True
 GPU_POWER_INTERVAL_SEC = 0.2
 
-PFX = "landauer_crud_final_v11"
+# Optional idle-baseline subtraction for GPU-side hardware diagnostics.
+# This records idle GPU power before and after the simulation and reports both
+# raw accelerator energy and idle-subtracted accelerator energy.
+ENABLE_GPU_IDLE_BASELINE = True
+GPU_IDLE_BASELINE_SECONDS = 60.0
+GPU_IDLE_SAMPLE_INTERVAL_SEC = 1.0
+
+PFX = "landauer_crud_final_v12"
 
 
 print("JAX devices:", jax.devices())
@@ -190,13 +197,17 @@ class GPUPowerLogger:
             print("[GPU logger] stopped.")
         return self.summary()
 
-    def summary(self):
+    def summary(self, idle_power_W=None):
         valid = [s for s in self.samples if np.isfinite(s.get("power_W", np.nan))]
         if len(valid) < 2:
             return {
                 "gpu_logger_available": bool(self.available),
                 "gpu_samples": len(valid),
                 "gpu_energy_J": None,
+                "gpu_raw_energy_J": None,
+                "gpu_idle_power_W": None if idle_power_W is None else float(idle_power_W),
+                "gpu_idle_subtracted_energy_J": None,
+                "gpu_net_mean_power_W": None,
                 "gpu_mean_power_W": None,
                 "gpu_max_power_W": None,
                 "gpu_elapsed_s": None,
@@ -205,7 +216,7 @@ class GPUPowerLogger:
 
         t = np.array([s["t_monotonic"] for s in valid], dtype=np.float64)
         p = np.array([s["power_W"] for s in valid], dtype=np.float64)
-        energy_J = float(np.trapz(p, t))
+        energy_J = float(np.trapezoid(p, t))
         elapsed_s = float(t[-1] - t[0])
 
         return {
@@ -237,13 +248,129 @@ class GPUPowerLogger:
         print(f"Exported: {fn}")
         return fn
 
+def query_gpu_power_once():
+    """
+    One-shot nvidia-smi query for GPU-side power diagnostics.
+
+    Returns:
+      dict with gpu_name, power_W, util_pct, memory_MiB, or None if unavailable.
+    """
+    if shutil.which("nvidia-smi") is None:
+        return None
+
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=name,power.draw,utilization.gpu,memory.used",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=2.0)
+        line = out.strip().splitlines()[0]
+        parts = [x.strip() for x in line.split(",")]
+        return {
+            "gpu_name": parts[0],
+            "power_W": float(parts[1]),
+            "util_pct": float(parts[2]),
+            "memory_MiB": float(parts[3]),
+        }
+    except Exception as exc:
+        return {
+            "gpu_name": "nvidia-smi-error",
+            "power_W": np.nan,
+            "util_pct": np.nan,
+            "memory_MiB": np.nan,
+            "error": str(exc),
+        }
+
+
+def measure_gpu_idle_baseline(duration_sec=60.0, interval_sec=1.0, label="idle"):
+    """
+    Measure idle GPU power before or after the simulation.
+
+    This estimates the accelerator-side baseline power. It is used only to
+    compute an implementation-level idle-subtracted GPU energy diagnostic:
+
+        E_netGPU = integral max(P_run(t) - P_idle, 0) dt
+
+    This is not the stochastic thermodynamic work <W> of the simulated memory.
+    """
+    if shutil.which("nvidia-smi") is None:
+        return {
+            "label": label,
+            "available": False,
+            "samples": 0,
+            "mean_power_W": None,
+            "std_power_W": None,
+            "min_power_W": None,
+            "max_power_W": None,
+            "gpu_name": None,
+            "reason": "nvidia-smi not found",
+        }
+
+    duration_sec = float(max(duration_sec, 0.0))
+    interval_sec = float(max(interval_sec, 0.05))
+
+    powers = []
+    utils = []
+    mems = []
+    names = []
+    t0 = time.monotonic()
+
+    while (time.monotonic() - t0) < duration_sec:
+        q = query_gpu_power_once()
+        if q is not None:
+            p = q.get("power_W", np.nan)
+            if np.isfinite(p):
+                powers.append(float(p))
+                utils.append(float(q.get("util_pct", np.nan)))
+                mems.append(float(q.get("memory_MiB", np.nan)))
+                names.append(q.get("gpu_name"))
+        time.sleep(interval_sec)
+
+    if len(powers) == 0:
+        return {
+            "label": label,
+            "available": False,
+            "samples": 0,
+            "mean_power_W": None,
+            "std_power_W": None,
+            "min_power_W": None,
+            "max_power_W": None,
+            "gpu_name": None,
+            "reason": "no valid idle power samples",
+        }
+
+    p = np.asarray(powers, dtype=np.float64)
+    u = np.asarray(utils, dtype=np.float64)
+    m = np.asarray(mems, dtype=np.float64)
+
+    return {
+        "label": label,
+        "available": True,
+        "samples": int(len(p)),
+        "mean_power_W": float(np.mean(p)),
+        "std_power_W": float(np.std(p)),
+        "min_power_W": float(np.min(p)),
+        "max_power_W": float(np.max(p)),
+        "mean_util_pct": None if not np.any(np.isfinite(u)) else float(np.nanmean(u)),
+        "mean_memory_MiB": None if not np.any(np.isfinite(m)) else float(np.nanmean(m)),
+        "gpu_name": next((name for name in names if name), None),
+        "duration_sec": duration_sec,
+        "interval_sec": interval_sec,
+    }
+
+
 def export_config_and_gpu_summary(config_dict, gpu_summary, prefix=PFX):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fn = f"{prefix}_run_config_gpu_summary_{ts}.json"
     payload = {
         "config": config_dict,
         "gpu_summary": gpu_summary,
-        "note": "GPU energy is accelerator-side nvidia-smi estimate only, not full server energy.",
+        "note": (
+            "GPU energy is accelerator-side nvidia-smi estimate only, not full server energy. "
+            "If idle baseline is available, gpu_idle_subtracted_energy_J estimates run energy above baseline. "
+            "Neither raw nor idle-subtracted GPU energy is the stochastic thermodynamic work <W>."
+        ),
     }
     with open(fn, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
@@ -1515,6 +1642,19 @@ def main():
     key = random.PRNGKey(42)
     landauer = KB * T0 * np.log(2.0)
 
+    idle_pre = None
+    if ENABLE_GPU_POWER_LOG and ENABLE_GPU_IDLE_BASELINE:
+        print()
+        print("=" * 72)
+        print("GPU IDLE BASELINE: pre-run")
+        print("=" * 72)
+        idle_pre = measure_gpu_idle_baseline(
+            duration_sec=GPU_IDLE_BASELINE_SECONDS,
+            interval_sec=GPU_IDLE_SAMPLE_INTERVAL_SEC,
+            label="pre_run_idle",
+        )
+        print(idle_pre)
+
     wall_start = time.time()
     gpu_logger = GPUPowerLogger(interval_sec=GPU_POWER_INTERVAL_SEC).start() if ENABLE_GPU_POWER_LOG else None
 
@@ -1646,8 +1786,41 @@ def main():
     print("SIMULATION COMPLETE")
     gpu_summary = None
     if gpu_logger is not None:
-        gpu_summary = gpu_logger.stop()
-        gpu_summary["wall_elapsed_s"] = float(time.time() - wall_start)
+        # Stop the run logger before measuring post-run idle power.
+        gpu_logger.stop()
+        wall_elapsed_s = float(time.time() - wall_start)
+
+        idle_post = None
+        if ENABLE_GPU_IDLE_BASELINE:
+            print()
+            print("=" * 72)
+            print("GPU IDLE BASELINE: post-run")
+            print("=" * 72)
+            idle_post = measure_gpu_idle_baseline(
+                duration_sec=GPU_IDLE_BASELINE_SECONDS,
+                interval_sec=GPU_IDLE_SAMPLE_INTERVAL_SEC,
+                label="post_run_idle",
+            )
+            print(idle_post)
+
+        idle_values = []
+        for idle in (idle_pre, idle_post):
+            if idle and idle.get("available") and idle.get("mean_power_W") is not None:
+                idle_values.append(float(idle["mean_power_W"]))
+        idle_power_W = float(np.mean(idle_values)) if idle_values else None
+
+        gpu_summary = gpu_logger.summary(idle_power_W=idle_power_W)
+        gpu_summary["wall_elapsed_s"] = wall_elapsed_s
+        gpu_summary["idle_pre"] = idle_pre
+        gpu_summary["idle_post"] = idle_post
+        gpu_summary["idle_baseline_enabled"] = bool(ENABLE_GPU_IDLE_BASELINE)
+        gpu_summary["idle_baseline_power_W"] = idle_power_W
+        gpu_summary["diagnostic_note"] = (
+            "GPU energy is accelerator-side only. Raw energy includes idle/baseboard-like accelerator draw; "
+            "idle-subtracted energy estimates implementation overhead above measured idle baseline. "
+            "Neither is the stochastic thermodynamic work <W>."
+        )
+
         gpu_logger.export_csv(prefix=PFX)
 
         config = {
@@ -1674,6 +1847,9 @@ def main():
             "DKL_BINS_SENSITIVITY": DKL_BINS_SENSITIVITY,
             "ENABLE_GPU_POWER_LOG": ENABLE_GPU_POWER_LOG,
             "GPU_POWER_INTERVAL_SEC": GPU_POWER_INTERVAL_SEC,
+            "ENABLE_GPU_IDLE_BASELINE": ENABLE_GPU_IDLE_BASELINE,
+            "GPU_IDLE_BASELINE_SECONDS": GPU_IDLE_BASELINE_SECONDS,
+            "GPU_IDLE_SAMPLE_INTERVAL_SEC": GPU_IDLE_SAMPLE_INTERVAL_SEC,
         }
         export_config_and_gpu_summary(config, gpu_summary, prefix=PFX)
 
@@ -1682,7 +1858,7 @@ def main():
         print("GPU HARDWARE DIAGNOSTIC")
         print("=" * 72)
         print(gpu_summary)
-        print("Note: GPU energy is accelerator-side only, not full server-level energy.")
+        print("Note: GPU energy is accelerator-side only; idle-subtracted energy is above measured idle baseline, not stochastic <W>.")
 
     print("=" * 72)
 
