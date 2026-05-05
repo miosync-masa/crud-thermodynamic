@@ -1,0 +1,82 @@
+{
+  "config": {
+    "VERSION": "CRUD-FIG-FINAL-v1.2-idle-baseline",
+    "KB": 1.0,
+    "GAMMA": 1.0,
+    "DT": 0.001,
+    "T0": 1.0,
+    "N_CORE": 10000,
+    "N_SCAN": 8000,
+    "N_CALIB": 2500,
+    "N_LAMBDA_STEPS": 2000,
+    "RELAX_CORE": 5,
+    "RELAX_LIST": [
+      1,
+      2,
+      5,
+      10,
+      20
+    ],
+    "B_HI": 4.0,
+    "B_LO": 0.2,
+    "C_MAG_DEFAULT": 3.0,
+    "UNBIAS_FRAC": 0.05,
+    "END_MODE": "unbias",
+    "WRITE_EPS_TARGET": 0.01,
+    "READ_GMAX": 2.0,
+    "READ_KMETER": 2.0,
+    "DKL_BINS": 240,
+    "DKL_BINS_SENSITIVITY": [
+      120,
+      240,
+      480
+    ],
+    "ENABLE_GPU_POWER_LOG": true,
+    "GPU_POWER_INTERVAL_SEC": 0.2,
+    "ENABLE_GPU_IDLE_BASELINE": true,
+    "GPU_IDLE_BASELINE_SECONDS": 60.0,
+    "GPU_IDLE_SAMPLE_INTERVAL_SEC": 1.0
+  },
+  "gpu_summary": {
+    "gpu_logger_available": true,
+    "gpu_samples": 5966,
+    "gpu_energy_J": 69653.00593414796,
+    "gpu_mean_power_W": 51.31918538384177,
+    "gpu_max_power_W": 52.28,
+    "gpu_elapsed_s": 1357.2516210409995,
+    "gpu_name": "NVIDIA A100-SXM4-40GB",
+    "wall_elapsed_s": 1357.2871363162994,
+    "idle_pre": {
+      "label": "pre_run_idle",
+      "available": true,
+      "samples": 59,
+      "mean_power_W": 50.91932203389831,
+      "std_power_W": 0.1598925953785237,
+      "min_power_W": 50.83,
+      "max_power_W": 51.74,
+      "mean_util_pct": 0.0,
+      "mean_memory_MiB": 30772.0,
+      "gpu_name": "NVIDIA A100-SXM4-40GB",
+      "duration_sec": 60.0,
+      "interval_sec": 1.0
+    },
+    "idle_post": {
+      "label": "post_run_idle",
+      "available": true,
+      "samples": 59,
+      "mean_power_W": 50.877288135593226,
+      "std_power_W": 0.11528638634368388,
+      "min_power_W": 50.55,
+      "max_power_W": 51.42,
+      "mean_util_pct": 0.0,
+      "mean_memory_MiB": 30772.0,
+      "gpu_name": "NVIDIA A100-SXM4-40GB",
+      "duration_sec": 60.0,
+      "interval_sec": 1.0
+    },
+    "idle_baseline_enabled": true,
+    "idle_baseline_power_W": 50.89830508474577,
+    "diagnostic_note": "GPU energy is accelerator-side only. Raw energy includes idle/baseboard-like accelerator draw; idle-subtracted energy estimates implementation overhead above measured idle baseline. Neither is the stochastic thermodynamic work <W>."
+  },
+  "note": "GPU energy is accelerator-side nvidia-smi estimate only, not full server energy. If idle baseline is available, gpu_idle_subtracted_energy_J estimates run energy above baseline. Neither raw nor idle-subtracted GPU energy is the stochastic thermodynamic work <W>."
+}
