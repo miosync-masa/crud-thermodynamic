@@ -6,16 +6,18 @@ Single-file CRUD information thermodynamics demo with:
   - Create / Read / Update / Delete in one codebase
   - Full accounting:
       DeltaF_total(full) = DeltaF_eq + kT * Delta D_KL(full)
-  - Exact macro / intra decomposition for C/U/D
+  - Histogram-based macro / intra KL decomposition for C/U/D
   - Read as measurement with system-meter coupling
   - Write endpoint epsilon micro-calibration
   - One integrated final figure + CSV export
   - Relax scan figure for C/U/D
+  - Optional GPU-side power logging via nvidia-smi
+  - DKL bin sensitivity scan for KL-accounting robustness
 
 Operation mapping used here:
   Create : blank0 -> 1
   Read   : non-destructive measurement
-  Update : unknown old value -> 1
+  Update : unknown old value -> 1  (overwrite-like update)
   Delete : unknown value -> blank0
 
 Interpretation:
@@ -29,6 +31,11 @@ Prepared for principle-presentation mode
 """
 
 import csv
+import json
+import shutil
+import subprocess
+import threading
+import time
 from datetime import datetime
 
 import numpy as np
@@ -43,7 +50,7 @@ from jax import random, jit, vmap
 # CONFIG
 # ============================================================
 
-VERSION = "CRUD-FIG-FINAL"
+VERSION = "CRUD-FIG-FINAL-v1.1"
 
 KB = 1.0
 GAMMA = 1.0
@@ -78,14 +85,20 @@ READ_STEPS = 2000
 READ_NPART = 10000
 
 DKL_BINS = 240
+DKL_BINS_SENSITIVITY = [120, 240, 480]
 
-PFX = "landauer_crud_final"
+# Optional hardware diagnostic.
+# In Colab this usually captures GPU-side power only; it is NOT full server energy.
+ENABLE_GPU_POWER_LOG = True
+GPU_POWER_INTERVAL_SEC = 0.2
+
+PFX = "landauer_crud_final_v11"
 
 
 print("JAX devices:", jax.devices())
 print("=" * 72)
 print(f"Landauer CRUD Thermodynamics Simulator ({VERSION})")
-print("DeltaF_eq + kT Delta D_KL(full) + Read measurement + final FIG")
+print("DeltaF_eq + kT Delta D_KL(full) + Read peak/final MI + GPU logging + final FIG")
 print("=" * 72)
 print(f"Landauer kT ln2 = {KB * T0 * np.log(2.0):.6f} (T={T0})")
 print(f"Particles(core): {N_CORE}")
@@ -95,6 +108,147 @@ print(f"Relax(core):     {RELAX_CORE}")
 print(f"b_hi={B_HI}, b_lo={B_LO}, c_mag(default)={C_MAG_DEFAULT}, unbias_frac={UNBIAS_FRAC}, end_mode={END_MODE}")
 print(f"Write eps target={WRITE_EPS_TARGET}, Read g_max={READ_GMAX}, k_meter={READ_KMETER}")
 print("=" * 72)
+
+
+
+# ============================================================
+# SECTION 0.5: Optional GPU-side power logging (Colab / nvidia-smi)
+# ============================================================
+
+class GPUPowerLogger:
+    """
+    Lightweight GPU-side power logger.
+
+    Notes:
+      - Uses nvidia-smi if available.
+      - Estimates accelerator-side energy only.
+      - This is a hardware diagnostic, not full server-level energy accounting.
+    """
+    def __init__(self, interval_sec=0.2):
+        self.interval_sec = float(interval_sec)
+        self.samples = []
+        self._stop = threading.Event()
+        self._thread = None
+        self.available = shutil.which("nvidia-smi") is not None
+
+    def _query_once(self):
+        cmd = [
+            "nvidia-smi",
+            "--query-gpu=name,power.draw,utilization.gpu,memory.used",
+            "--format=csv,noheader,nounits",
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=2.0)
+        # Use first visible GPU.
+        line = out.strip().splitlines()[0]
+        parts = [x.strip() for x in line.split(",")]
+        name = parts[0]
+        power_W = float(parts[1])
+        util_pct = float(parts[2])
+        mem_MiB = float(parts[3])
+        return name, power_W, util_pct, mem_MiB
+
+    def _loop(self):
+        while not self._stop.is_set():
+            t_mono = time.monotonic()
+            t_wall = time.time()
+            try:
+                name, power_W, util_pct, mem_MiB = self._query_once()
+                self.samples.append({
+                    "t_monotonic": t_mono,
+                    "t_wall": t_wall,
+                    "gpu_name": name,
+                    "power_W": power_W,
+                    "util_pct": util_pct,
+                    "memory_MiB": mem_MiB,
+                })
+            except Exception as exc:
+                self.samples.append({
+                    "t_monotonic": t_mono,
+                    "t_wall": t_wall,
+                    "gpu_name": "nvidia-smi-error",
+                    "power_W": np.nan,
+                    "util_pct": np.nan,
+                    "memory_MiB": np.nan,
+                    "error": str(exc),
+                })
+            self._stop.wait(self.interval_sec)
+
+    def start(self):
+        if not self.available:
+            print("[GPU logger] nvidia-smi not found; GPU power logging disabled.")
+            return self
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        print(f"[GPU logger] started, interval={self.interval_sec:.3f}s")
+        return self
+
+    def stop(self):
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=3.0)
+            print("[GPU logger] stopped.")
+        return self.summary()
+
+    def summary(self):
+        valid = [s for s in self.samples if np.isfinite(s.get("power_W", np.nan))]
+        if len(valid) < 2:
+            return {
+                "gpu_logger_available": bool(self.available),
+                "gpu_samples": len(valid),
+                "gpu_energy_J": None,
+                "gpu_mean_power_W": None,
+                "gpu_max_power_W": None,
+                "gpu_elapsed_s": None,
+                "gpu_name": valid[0]["gpu_name"] if valid else None,
+            }
+
+        t = np.array([s["t_monotonic"] for s in valid], dtype=np.float64)
+        p = np.array([s["power_W"] for s in valid], dtype=np.float64)
+        energy_J = float(np.trapz(p, t))
+        elapsed_s = float(t[-1] - t[0])
+
+        return {
+            "gpu_logger_available": True,
+            "gpu_samples": int(len(valid)),
+            "gpu_energy_J": energy_J,
+            "gpu_mean_power_W": float(np.mean(p)),
+            "gpu_max_power_W": float(np.max(p)),
+            "gpu_elapsed_s": elapsed_s,
+            "gpu_name": valid[0]["gpu_name"],
+        }
+
+    def export_csv(self, prefix=PFX):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fn = f"{prefix}_gpu_power_log_{ts}.csv"
+        with open(fn, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["t_monotonic", "t_wall", "gpu_name", "power_W", "util_pct", "memory_MiB", "error"])
+            for s in self.samples:
+                w.writerow([
+                    s.get("t_monotonic"),
+                    s.get("t_wall"),
+                    s.get("gpu_name"),
+                    s.get("power_W"),
+                    s.get("util_pct"),
+                    s.get("memory_MiB"),
+                    s.get("error", ""),
+                ])
+        print(f"Exported: {fn}")
+        return fn
+
+def export_config_and_gpu_summary(config_dict, gpu_summary, prefix=PFX):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fn = f"{prefix}_run_config_gpu_summary_{ts}.json"
+    payload = {
+        "config": config_dict,
+        "gpu_summary": gpu_summary,
+        "note": "GPU energy is accelerator-side nvidia-smi estimate only, not full server energy.",
+    }
+    with open(fn, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"Exported: {fn}")
+    return fn
 
 
 # ============================================================
@@ -679,7 +833,8 @@ def refine_write_cmag_endpoint(c_init, *,
 
 def run_crud_operation(op_name, *,
                        b_hi, b_lo, c_mag, unbias_frac, end_mode,
-                       n_lambda_steps, relax_steps, n_particles, T, key):
+                       n_lambda_steps, relax_steps, n_particles, T, key,
+                       dkl_bins=DKL_BINS):
     proto, init_region, target = make_protocol(op_name, b_hi, b_lo, c_mag, unbias_frac, end_mode)
     b0, c0 = proto(0.0)
     b1, c1 = proto(1.0)
@@ -687,12 +842,13 @@ def run_crud_operation(op_name, *,
     key, k_init, k_run = random.split(key, 3)
     x0 = sample_equilibrium_positions(float(b0), float(c0), T, n_particles, k_init, region=init_region)
 
-    dkl_init = compute_dkl_full_macro_intra(x0, float(b0), float(c0), T, n_bins=DKL_BINS)
+    dkl_init = compute_dkl_full_macro_intra(x0, float(b0), float(c0), T, n_bins=dkl_bins)
     x1, W_samples = simulate_protocol(proto, x0, n_lambda_steps, relax_steps, T, k_run)
-    dkl_final = compute_dkl_full_macro_intra(x1, float(b1), float(c1), T, n_bins=DKL_BINS)
+    dkl_final = compute_dkl_full_macro_intra(x1, float(b1), float(c1), T, n_bins=dkl_bins)
 
     meanW = float(jnp.mean(W_samples))
     stdW = float(jnp.std(W_samples))
+    semW = float(stdW / np.sqrt(max(int(n_particles), 1)))
 
     deltaF_eq = free_energy_eq(float(b1), float(c1), T, region=None) - free_energy_eq(float(b0), float(c0), T, region=None)
 
@@ -704,16 +860,31 @@ def run_crud_operation(op_name, *,
     W_diss = meanW - deltaF_total
 
     eps = estimate_eps(x1, target=target)
+    eps_se = float(np.sqrt(max(eps * (1.0 - eps), 0.0) / max(int(n_particles), 1)))
     pR_init = float(dkl_init["pR_emp"])
     pR_final = float(dkl_final["pR_emp"])
 
-    jarz = float(jarzynski_deltaF(W_samples, T))
-    deltaF_logical_eps = landauer_logical_deltaF(eps, T)
+    # Jarzynski diagnostic is only standard for full-canonical initial ensembles.
+    # Create uses conditional initial equilibrium (blank0/left), so report N/A.
+    jarz = None if op_name == "Create" else float(jarzynski_deltaF(W_samples, T))
+
+    # Landauer logical error formula is meaningful for operations that compress an
+    # unknown logical state into a target state (Delete, overwrite-like Update).
+    # For Create (known blank0 -> known 1), report N/A to avoid false erasure framing.
+    deltaF_logical_eps = None if op_name == "Create" else landauer_logical_deltaF(eps, T)
+
+    note = {
+        "Create": "write-like / known-to-known",
+        "Update": "overwrite-like / unknown-to-target",
+        "Delete": "landauer-like / unknown-to-blank0",
+    }[op_name]
 
     return {
         "op": op_name,
+        "note": note,
         "meanW": meanW,
         "stdW": stdW,
+        "semW": semW,
         "deltaF_eq": float(deltaF_eq),
         "deltaF_info_full": float(deltaF_info_full),
         "deltaF_macro": float(deltaF_macro),
@@ -731,19 +902,26 @@ def run_crud_operation(op_name, *,
         "recon_err_final": float(dkl_final["recon_err"]),
 
         "eps": float(eps),
+        "eps_se": eps_se,
         "pR_init": float(pR_init),
         "pR_final": float(pR_final),
-        "deltaF_logical_eps": float(deltaF_logical_eps),
-        "jarzynski_diag_deltaF": float(jarz),
+        "deltaF_logical_eps": None if deltaF_logical_eps is None else float(deltaF_logical_eps),
+        "jarzynski_diag_deltaF": jarz,
 
         "c_mag": float(c_mag),
         "relax_steps": int(relax_steps),
         "n_lambda_steps": int(n_lambda_steps),
         "n_particles": int(n_particles),
         "target": target,
+        "dkl_bins": int(dkl_bins),
+        "b0": float(b0),
+        "c0": float(c0),
+        "b1": float(b1),
+        "c1": float(c1),
+        "init_region": init_region,
+        "init_x": x0,
         "final_x": x1,
     }
-
 
 # ============================================================
 # SECTION 7: Read operation
@@ -820,6 +998,10 @@ def run_read_simulation(n_steps, n_particles, T, key, g_max=READ_GMAX, k_meter=R
     traj = []
 
     params = [protocol_read(i / n_steps, g_max=g_max) for i in range(n_steps + 1)]
+    peak_index = int(round(0.8 * n_steps))
+
+    x_peak = None
+    y_peak = None
 
     for i in range(n_steps):
         b_old, c_old, g_old = params[i]
@@ -837,43 +1019,77 @@ def run_read_simulation(n_steps, n_particles, T, key, g_max=READ_GMAX, k_meter=R
         keys = random.split(sub, n_particles)
         x, y = step_coupled_batch(x, y, keys, b_new, c_new, g_new, k_meter, T)
 
+        # End of measurement hold / just before substantial decoupling.
+        if (i + 1) == peak_index:
+            x_peak = x
+            y_peak = y
+
+    if x_peak is None:
+        x_peak = x
+        y_peak = y
+
     total_work = total_work_sys + total_work_cpl
 
     meanW = float(jnp.mean(total_work))
     stdW = float(jnp.std(total_work))
+    semW = float(stdW / np.sqrt(max(int(n_particles), 1)))
     deltaF_theory = 0.0
     W_diss = meanW - deltaF_theory
 
     deltaF_jarz = float(jarzynski_deltaF(total_work, T))
 
-    MI_nats, MI_bits = estimate_mutual_information(x, y)
-    acc = estimate_measurement_accuracy(x, y)
+    MI_nats_peak, MI_bits_peak = estimate_mutual_information(x_peak, y_peak)
+    acc_peak = estimate_measurement_accuracy(x_peak, y_peak)
+
+    MI_nats_final, MI_bits_final = estimate_mutual_information(x, y)
+    acc_final = estimate_measurement_accuracy(x, y)
+
+    # Main Read metric uses measurement-time correlation; final values are stored separately.
+    MI_nats = MI_nats_peak
+    MI_bits = MI_bits_peak
+    acc = acc_peak
 
     sagawa_bound = -KB * T * MI_nats
     sagawa_ok = (W_diss >= sagawa_bound - 1e-2)
 
     return {
         "op": "Read",
+        "note": "measurement / correlation generation",
         "meanW": meanW,
         "stdW": stdW,
+        "semW": semW,
         "deltaF_eq": 0.0,
         "deltaF_info_full": 0.0,
-        "deltaF_macro": 0.0,
-        "deltaF_intra": 0.0,
+        "deltaF_macro": None,
+        "deltaF_intra": None,
         "deltaF_total": 0.0,
         "W_diss": W_diss,
         "deltaF_jarz": deltaF_jarz,
+
         "MI_nats": MI_nats,
         "MI_bits": MI_bits,
         "accuracy": acc,
         "measurement_error": 1.0 - acc,
+
+        "MI_nats_peak": MI_nats_peak,
+        "MI_bits_peak": MI_bits_peak,
+        "accuracy_peak": acc_peak,
+        "measurement_error_peak": 1.0 - acc_peak,
+
+        "MI_nats_final": MI_nats_final,
+        "MI_bits_final": MI_bits_final,
+        "accuracy_final": acc_final,
+        "measurement_error_final": 1.0 - acc_final,
+        "MI_decay_bits": MI_bits_peak - MI_bits_final,
+
         "sagawa_bound": sagawa_bound,
         "sagawa_ok": bool(sagawa_ok),
         "final_x": x,
         "final_y": y,
+        "peak_x": x_peak,
+        "peak_y": y_peak,
         "trajectory": np.array(traj, dtype=np.float64),
     }
-
 
 # ============================================================
 # SECTION 8: Relax scan
@@ -944,6 +1160,60 @@ def run_relax_scan(relax_list, *, T, key):
     return rows, write_calib_map
 
 
+
+# ============================================================
+# SECTION 8.5: DKL bin sensitivity scan
+# ============================================================
+
+def run_dkl_bin_sensitivity(core_results, bins_list=DKL_BINS_SENSITIVITY, T=T0):
+    """
+    Recompute KL accounting for stored initial/final samples at multiple bin counts.
+
+    Purpose:
+      Verify that the central state-function quantity kT Delta D_KL(full)
+      is not an artifact of a single histogram resolution.
+    """
+    rows = []
+    print()
+    print("=" * 72)
+    print("DKL BIN SENSITIVITY SCAN")
+    print(f"bins_list: {bins_list}")
+    print("=" * 72)
+
+    for r in core_results:
+        op = r["op"]
+        print(f"\n[{op}]")
+        for nb in bins_list:
+            d0 = compute_dkl_full_macro_intra(r["init_x"], r["b0"], r["c0"], T, n_bins=int(nb))
+            d1 = compute_dkl_full_macro_intra(r["final_x"], r["b1"], r["c1"], T, n_bins=int(nb))
+
+            deltaF_info_full = KB * T * (d1["DKL_full"] - d0["DKL_full"])
+            deltaF_macro = KB * T * (d1["DKL_macro"] - d0["DKL_macro"])
+            deltaF_intra = KB * T * (d1["DKL_intra_weighted"] - d0["DKL_intra_weighted"])
+            deltaF_total = r["deltaF_eq"] + deltaF_info_full
+            W_diss = r["meanW"] - deltaF_total
+
+            row = {
+                "op": op,
+                "n_bins": int(nb),
+                "meanW": r["meanW"],
+                "deltaF_eq": r["deltaF_eq"],
+                "deltaF_info_full": float(deltaF_info_full),
+                "deltaF_macro": float(deltaF_macro),
+                "deltaF_intra": float(deltaF_intra),
+                "deltaF_total": float(deltaF_total),
+                "W_diss": float(W_diss),
+                "DKL_init_full": d0["DKL_full"],
+                "DKL_final_full": d1["DKL_full"],
+                "recon_err_init": d0["recon_err"],
+                "recon_err_final": d1["recon_err"],
+            }
+            rows.append(row)
+            print(f"  bins={int(nb):4d}  DeltaF_total={deltaF_total:+.6f}  "
+                  f"W_diss={W_diss:+.6f}  recon=({d0['recon_err']:+.2e},{d1['recon_err']:+.2e})")
+    return rows
+
+
 # ============================================================
 # SECTION 9: CSV export
 # ============================================================
@@ -955,29 +1225,50 @@ def export_core_csv(core_results, read_result, write_calib, prefix=PFX):
     with open(fn, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "op", "meanW", "stdW", "deltaF_eq", "deltaF_info_full", "deltaF_macro", "deltaF_intra",
-            "deltaF_total", "W_diss", "eps_or_meas_error", "pR_init", "pR_final",
+            "op", "note", "meanW", "stdW", "semW",
+            "deltaF_eq", "deltaF_info_full", "deltaF_macro", "deltaF_intra",
+            "deltaF_total", "W_diss",
+            "eps_or_meas_error", "eps_se", "pR_init", "pR_final",
             "deltaF_logical_eps", "jarzynski_diag_deltaF",
-            "MI_bits", "accuracy", "sagawa_bound", "sagawa_ok",
-            "write_c_analytic", "write_c_refined", "write_calib_status"
+            "DKL_init_full", "DKL_final_full",
+            "DKL_init_macro", "DKL_final_macro",
+            "DKL_init_intra", "DKL_final_intra",
+            "recon_err_init", "recon_err_final",
+            "MI_bits_peak", "MI_bits_final", "MI_decay_bits",
+            "accuracy_peak", "accuracy_final",
+            "sagawa_bound", "sagawa_ok",
+            "c_mag", "write_c_analytic", "write_c_refined", "write_calib_status"
         ])
 
         for r in core_results:
             w.writerow([
-                r["op"], r["meanW"], r["stdW"], r["deltaF_eq"], r["deltaF_info_full"],
-                r["deltaF_macro"], r["deltaF_intra"], r["deltaF_total"], r["W_diss"],
-                r["eps"], r["pR_init"], r["pR_final"], r["deltaF_logical_eps"],
-                r["jarzynski_diag_deltaF"], None, None, None, None,
-                write_calib["c_analytic"], write_calib["c_refined"], write_calib["status"]
+                r["op"], r["note"], r["meanW"], r["stdW"], r["semW"],
+                r["deltaF_eq"], r["deltaF_info_full"],
+                r["deltaF_macro"], r["deltaF_intra"],
+                r["deltaF_total"], r["W_diss"],
+                r["eps"], r["eps_se"], r["pR_init"], r["pR_final"],
+                r["deltaF_logical_eps"], r["jarzynski_diag_deltaF"],
+                r["DKL_init_full"], r["DKL_final_full"],
+                r["DKL_init_macro"], r["DKL_final_macro"],
+                r["DKL_init_intra"], r["DKL_final_intra"],
+                r["recon_err_init"], r["recon_err_final"],
+                None, None, None, None, None, None, None,
+                r["c_mag"], write_calib["c_analytic"], write_calib["c_refined"], write_calib["status"]
             ])
 
         rr = read_result
         w.writerow([
-            rr["op"], rr["meanW"], rr["stdW"], rr["deltaF_eq"], rr["deltaF_info_full"],
-            rr["deltaF_macro"], rr["deltaF_intra"], rr["deltaF_total"], rr["W_diss"],
-            rr["measurement_error"], None, None, None, rr["deltaF_jarz"],
-            rr["MI_bits"], rr["accuracy"], rr["sagawa_bound"], rr["sagawa_ok"],
-            write_calib["c_analytic"], write_calib["c_refined"], write_calib["status"]
+            rr["op"], rr["note"], rr["meanW"], rr["stdW"], rr["semW"],
+            rr["deltaF_eq"], rr["deltaF_info_full"],
+            rr["deltaF_macro"], rr["deltaF_intra"],
+            rr["deltaF_total"], rr["W_diss"],
+            rr["measurement_error"], None, None, None,
+            None, rr["deltaF_jarz"],
+            None, None, None, None, None, None, None, None,
+            rr["MI_bits_peak"], rr["MI_bits_final"], rr["MI_decay_bits"],
+            rr["accuracy_peak"], rr["accuracy_final"],
+            rr["sagawa_bound"], rr["sagawa_ok"],
+            None, write_calib["c_analytic"], write_calib["c_refined"], write_calib["status"]
         ])
 
     print(f"Exported: {fn}")
@@ -1003,6 +1294,33 @@ def export_relax_csv(scan_rows, calib_map, prefix=PFX):
                 info["c_analytic"], info["c_refined"], info["status"], info["eps_mean"], info["eps_std"],
                 r["meanW"], r["deltaF_total"], r["W_diss"], r["deltaF_info_full"],
                 r["deltaF_macro"], r["deltaF_intra"], r["eps"], r["pR_init"], r["pR_final"]
+            ])
+
+    print(f"Exported: {fn}")
+    return fn
+
+
+
+def export_dkl_sensitivity_csv(sensitivity_rows, prefix=PFX):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fn = f"{prefix}_dkl_bin_sensitivity_{ts}.csv"
+
+    with open(fn, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "op", "n_bins", "meanW", "deltaF_eq",
+            "deltaF_info_full", "deltaF_macro", "deltaF_intra",
+            "deltaF_total", "W_diss",
+            "DKL_init_full", "DKL_final_full",
+            "recon_err_init", "recon_err_final",
+        ])
+        for r in sensitivity_rows:
+            w.writerow([
+                r["op"], r["n_bins"], r["meanW"], r["deltaF_eq"],
+                r["deltaF_info_full"], r["deltaF_macro"], r["deltaF_intra"],
+                r["deltaF_total"], r["W_diss"],
+                r["DKL_init_full"], r["DKL_final_full"],
+                r["recon_err_init"], r["recon_err_final"],
             ])
 
     print(f"Exported: {fn}")
@@ -1120,7 +1438,7 @@ def plot_final_integrated_figure(core_results, read_result, scan_rows, write_cal
     vals = [read_result["W_diss"], read_result["sagawa_bound"]]
     ax.bar(labels, vals, alpha=0.8)
     ax.axhline(0.0, color="k", linewidth=0.7)
-    title = f"Read summary: MI={read_result['MI_bits']:.3f} bits, Acc={read_result['accuracy']:.1%}"
+    title = f"Read: MI_peak={read_result['MI_bits_peak']:.3f} bits -> MI_final={read_result['MI_bits_final']:.3f} bits"
     ax.set_title(title)
     ax.set_ylabel("Energy")
     ax.grid(True, alpha=0.25, axis="y")
@@ -1133,8 +1451,8 @@ def plot_final_integrated_figure(core_results, read_result, scan_rows, write_cal
     print(f"Saved: {prefix}_final_integrated_fig.png/pdf")
 
 def plot_read_scatter(read_result, prefix=PFX):
-    x = np.array(read_result["final_x"])
-    y = np.array(read_result["final_y"])
+    x = np.array(read_result["peak_x"])
+    y = np.array(read_result["peak_y"])
 
     n_plot = min(2500, len(x))
     plt.figure(figsize=(6, 5))
@@ -1143,7 +1461,7 @@ def plot_read_scatter(read_result, prefix=PFX):
     plt.axvline(0.0, color="k", linewidth=0.6)
     plt.xlabel("system x")
     plt.ylabel("meter y")
-    plt.title(f"Read scatter: MI={read_result['MI_bits']:.3f} bits, Acc={read_result['accuracy']:.1%}")
+    plt.title(f"Read scatter at measurement peak: MI={read_result['MI_bits_peak']:.3f} bits, Acc={read_result['accuracy_peak']:.1%}")
     plt.grid(True, alpha=0.25)
     plt.tight_layout()
     plt.savefig(f"{prefix}_read_scatter.png", dpi=150, bbox_inches="tight")
@@ -1153,6 +1471,42 @@ def plot_read_scatter(read_result, prefix=PFX):
     print(f"Saved: {prefix}_read_scatter.png/pdf")
 
 
+
+def plot_dkl_bin_sensitivity(sensitivity_rows, prefix=PFX):
+    if not sensitivity_rows:
+        return
+
+    ops = sorted(set(r["op"] for r in sensitivity_rows))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    ax = axes[0]
+    for op in ops:
+        rows = sorted([r for r in sensitivity_rows if r["op"] == op], key=lambda z: z["n_bins"])
+        ax.plot([r["n_bins"] for r in rows], [r["deltaF_total"] for r in rows], "o-", label=op)
+    ax.set_xlabel("DKL histogram bins")
+    ax.set_ylabel("DeltaF_total")
+    ax.set_title("DKL bin sensitivity: DeltaF_total")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    ax = axes[1]
+    for op in ops:
+        rows = sorted([r for r in sensitivity_rows if r["op"] == op], key=lambda z: z["n_bins"])
+        ax.plot([r["n_bins"] for r in rows], [r["W_diss"] for r in rows], "o-", label=op)
+    ax.set_xlabel("DKL histogram bins")
+    ax.set_ylabel("W_diss")
+    ax.set_title("DKL bin sensitivity: W_diss")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(f"{prefix}_dkl_bin_sensitivity.png", dpi=150, bbox_inches="tight")
+    plt.savefig(f"{prefix}_dkl_bin_sensitivity.pdf", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved: {prefix}_dkl_bin_sensitivity.png/pdf")
+
+
 # ============================================================
 # SECTION 11: MAIN
 # ============================================================
@@ -1160,6 +1514,9 @@ def plot_read_scatter(read_result, prefix=PFX):
 def main():
     key = random.PRNGKey(42)
     landauer = KB * T0 * np.log(2.0)
+
+    wall_start = time.time()
+    gpu_logger = GPUPowerLogger(interval_sec=GPU_POWER_INTERVAL_SEC).start() if ENABLE_GPU_POWER_LOG else None
 
     print()
     print("=" * 72)
@@ -1217,9 +1574,15 @@ def main():
         print(f"  <W>={r['meanW']:+.6f}  DeltaF_eq={r['deltaF_eq']:+.6f}")
         print(f"  DeltaF_info(full)={r['deltaF_info_full']:+.6f}  (macro={r['deltaF_macro']:+.6f}, intra={r['deltaF_intra']:+.6f})")
         print(f"  DeltaF_total={r['deltaF_total']:+.6f}  W_diss={r['W_diss']:+.6f}")
-        print(f"  eps={r['eps']:.4f}  pR_init={r['pR_init']:.3f} -> pR_final={r['pR_final']:.3f}")
-        print(f"  Landauer-logical from eps = {r['deltaF_logical_eps']:+.6f}")
-        print(f"  Jarzynski diagnostic = {r['jarzynski_diag_deltaF']:+.6f}")
+        print(f"  eps={r['eps']:.4f}±{r['eps_se']:.4f}  pR_init={r['pR_init']:.3f} -> pR_final={r['pR_final']:.3f}")
+        if r['deltaF_logical_eps'] is None:
+            print("  Landauer-logical from eps = N/A (Create is known-to-known, not erasure)")
+        else:
+            print(f"  Landauer-logical from eps = {r['deltaF_logical_eps']:+.6f}")
+        if r['jarzynski_diag_deltaF'] is None:
+            print("  Jarzynski diagnostic = N/A (conditional initial ensemble)")
+        else:
+            print(f"  Jarzynski diagnostic = {r['jarzynski_diag_deltaF']:+.6f}")
 
     print()
     print("[Read]")
@@ -1233,7 +1596,8 @@ def main():
         k_meter=READ_KMETER,
     )
     print(f"  <W>={read_result['meanW']:+.6f}  DeltaF_theory=+0.000000  W_diss={read_result['W_diss']:+.6f}")
-    print(f"  MI={read_result['MI_bits']:.4f} bits  accuracy={read_result['accuracy']:.2%}  measurement_error={read_result['measurement_error']:.4f}")
+    print(f"  MI_peak={read_result['MI_bits_peak']:.4f} bits  Acc_peak={read_result['accuracy_peak']:.2%}  err_peak={read_result['measurement_error_peak']:.4f}")
+    print(f"  MI_final={read_result['MI_bits_final']:.4f} bits  Acc_final={read_result['accuracy_final']:.2%}  MI_decay={read_result['MI_decay_bits']:+.4f} bits")
     print(f"  Sagawa bound={read_result['sagawa_bound']:+.6f}  satisfied={read_result['sagawa_ok']}")
 
     print()
@@ -1251,9 +1615,12 @@ def main():
             print(f"{op:10} {read_result['meanW']:+10.4f} {read_result['deltaF_total']:+14.4f} {read_result['W_diss']:+12.4f} "
                   f"{read_result['measurement_error']:10.4f} {'measurement':>20}")
         else:
-            note = "write-like" if op in ("Create", "Update") else "landauer-like"
             rr = core_map[op]
+            note = rr.get("note", "")
             print(f"{op:10} {rr['meanW']:+10.4f} {rr['deltaF_total']:+14.4f} {rr['W_diss']:+12.4f} {rr['eps']:10.4f} {note:>20}")
+
+    # DKL bin sensitivity scan
+    sensitivity_rows = run_dkl_bin_sensitivity(core_results, bins_list=DKL_BINS_SENSITIVITY, T=T0)
 
     # Relax scan
     scan_rows, write_calib_map = run_relax_scan(RELAX_LIST, T=T0, key=key)
@@ -1264,6 +1631,7 @@ def main():
     print("=" * 72)
     export_core_csv(core_results, read_result, write_calib, prefix=PFX)
     export_relax_csv(scan_rows, write_calib_map, prefix=PFX)
+    export_dkl_sensitivity_csv(sensitivity_rows, prefix=PFX)
 
     print()
     print("=" * 72)
@@ -1271,13 +1639,54 @@ def main():
     print("=" * 72)
     plot_final_integrated_figure(core_results, read_result, scan_rows, write_calib, prefix=PFX)
     plot_read_scatter(read_result, prefix=PFX)
+    plot_dkl_bin_sensitivity(sensitivity_rows, prefix=PFX)
 
     print()
     print("=" * 72)
     print("SIMULATION COMPLETE")
+    gpu_summary = None
+    if gpu_logger is not None:
+        gpu_summary = gpu_logger.stop()
+        gpu_summary["wall_elapsed_s"] = float(time.time() - wall_start)
+        gpu_logger.export_csv(prefix=PFX)
+
+        config = {
+            "VERSION": VERSION,
+            "KB": KB,
+            "GAMMA": GAMMA,
+            "DT": DT,
+            "T0": T0,
+            "N_CORE": N_CORE,
+            "N_SCAN": N_SCAN,
+            "N_CALIB": N_CALIB,
+            "N_LAMBDA_STEPS": N_LAMBDA_STEPS,
+            "RELAX_CORE": RELAX_CORE,
+            "RELAX_LIST": RELAX_LIST,
+            "B_HI": B_HI,
+            "B_LO": B_LO,
+            "C_MAG_DEFAULT": C_MAG_DEFAULT,
+            "UNBIAS_FRAC": UNBIAS_FRAC,
+            "END_MODE": END_MODE,
+            "WRITE_EPS_TARGET": WRITE_EPS_TARGET,
+            "READ_GMAX": READ_GMAX,
+            "READ_KMETER": READ_KMETER,
+            "DKL_BINS": DKL_BINS,
+            "DKL_BINS_SENSITIVITY": DKL_BINS_SENSITIVITY,
+            "ENABLE_GPU_POWER_LOG": ENABLE_GPU_POWER_LOG,
+            "GPU_POWER_INTERVAL_SEC": GPU_POWER_INTERVAL_SEC,
+        }
+        export_config_and_gpu_summary(config, gpu_summary, prefix=PFX)
+
+        print()
+        print("=" * 72)
+        print("GPU HARDWARE DIAGNOSTIC")
+        print("=" * 72)
+        print(gpu_summary)
+        print("Note: GPU energy is accelerator-side only, not full server-level energy.")
+
     print("=" * 72)
 
-    return core_results, read_result, scan_rows, write_calib_map
+    return core_results, read_result, scan_rows, write_calib_map, sensitivity_rows, gpu_summary
 
 
 if __name__ == "__main__":
