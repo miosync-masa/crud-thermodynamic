@@ -31,14 +31,15 @@ Delete is not special because it is the only thermodynamic operation — it is s
 ├── README.md
 ├── LICENSE
 ├── crud_simulator.py            # Single-file JAX simulator (GPU)
+├── landauer_crud_final_v13_underdamped.py
 ├── figures/
 │   ├── fig1_crud_overview.pdf   # Integrated 6-panel CRUD figure
 │   └── fig2_read_scatter.pdf    # System-meter scatter for Read
 ├── data/
 │   ├── *_core_summary_*.csv     # Core CRUD results
 │   └── *_relax_scan_*.csv       # Quasi-static relaxation scan
-└── paper/
-    ├── From_Erasure_to_CRUD.pdf # Manuscript (elsarticle, PLA format)
+└── Lean4/
+    ├──Lean file (No Sorry)
 ```
 
 ## Simulation Features
